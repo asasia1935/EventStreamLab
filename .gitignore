@@ -1,0 +1,27 @@
+# Build output
+/build/
+/out/
+/.vs/
+
+# CMake generated files
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+
+# Visual Studio user and build files
+*.user
+*.suo
+*.sln.docstates
+*.VC.db
+*.VC.VC.opendb
+
+# Compiled binaries and object/library files
+*.exe
+*.obj
+*.lib
+*.pdb
+*.ilk
+*.pch
+*.idb
+*.tlog
