@@ -5,6 +5,7 @@
 #else
 #include <arpa/inet.h>
 #include <cerrno>
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #endif
@@ -64,6 +65,41 @@ void closeSocket(SocketHandle socket) {
 #else
     close(socket);
 #endif
+}
+
+bool setNonBlocking(SocketHandle socketHandle, std::string& error) {
+    error.clear();
+    if (!isValidSocket(socketHandle)) {
+        error = "setNonBlocking() failed: invalid socket";
+        return false;
+    }
+
+#if defined(_WIN32)
+    u_long nonBlocking = 1;
+    if (ioctlsocket(socketHandle, FIONBIO, &nonBlocking) != 0) {
+        error = socketError("ioctlsocket(FIONBIO)", lastSocketError());
+        return false;
+    }
+#else
+    int flags;
+    do {
+        flags = fcntl(socketHandle, F_GETFL, 0);
+    } while (flags == -1 && errno == EINTR);
+    if (flags == -1) {
+        error = socketError("fcntl(F_GETFL)", errno);
+        return false;
+    }
+
+    int result;
+    do {
+        result = fcntl(socketHandle, F_SETFL, flags | O_NONBLOCK);
+    } while (result == -1 && errno == EINTR);
+    if (result == -1) {
+        error = socketError("fcntl(F_SETFL)", errno);
+        return false;
+    }
+#endif
+    return true;
 }
 
 SocketHandle connectTcp(const std::string& host, std::uint16_t port,

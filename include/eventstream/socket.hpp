@@ -24,6 +24,7 @@ void cleanupSockets();
 
 bool isValidSocket(SocketHandle socket);
 void closeSocket(SocketHandle socket);
+bool setNonBlocking(SocketHandle socket, std::string& error);
 
 SocketHandle connectTcp(const std::string& host, std::uint16_t port,
                         std::string& error);

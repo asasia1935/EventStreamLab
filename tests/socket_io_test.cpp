@@ -3,6 +3,7 @@
 #if defined(_WIN32)
 #include <ws2tcpip.h>
 #else
+#include <cerrno>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #endif
@@ -198,12 +199,92 @@ bool testCleanPeerCloseStatus() {
                            eventstream::RecvExactResult::PeerClosed);
 }
 
+bool testNonBlockingReceiveWithoutData() {
+#if defined(_WIN32)
+    std::cout << "Non-blocking POSIX behavior test skipped on Windows\n";
+    return true;
+#else
+    std::string error;
+    if (!eventstream::initializeSockets(error)) {
+        std::cerr << "Non-blocking receive setup failed: " << error << '\n';
+        return false;
+    }
+
+    const auto listener = eventstream::createTcpListener(0, error);
+    if (!eventstream::isValidSocket(listener)) {
+        std::cerr << "Non-blocking test listener creation failed: " << error
+                  << '\n';
+        eventstream::cleanupSockets();
+        return false;
+    }
+
+    std::uint16_t port{};
+    if (!getBoundPort(listener, port, error)) {
+        std::cerr << "Non-blocking test port lookup failed: " << error << '\n';
+        eventstream::closeSocket(listener);
+        eventstream::cleanupSockets();
+        return false;
+    }
+
+    const auto client = eventstream::connectTcp("127.0.0.1", port, error);
+    if (!eventstream::isValidSocket(client)) {
+        std::cerr << "Non-blocking test client connect failed: " << error
+                  << '\n';
+        eventstream::closeSocket(listener);
+        eventstream::cleanupSockets();
+        return false;
+    }
+
+    const auto accepted = eventstream::acceptTcp(listener, error);
+    if (!eventstream::isValidSocket(accepted)) {
+        std::cerr << "Non-blocking test accept failed: " << error << '\n';
+        eventstream::closeSocket(client);
+        eventstream::closeSocket(listener);
+        eventstream::cleanupSockets();
+        return false;
+    }
+
+    if (!eventstream::setNonBlocking(accepted, error)) {
+        std::cerr << "setNonBlocking() failed: " << error << '\n';
+        eventstream::closeSocket(accepted);
+        eventstream::closeSocket(client);
+        eventstream::closeSocket(listener);
+        eventstream::cleanupSockets();
+        return false;
+    }
+
+    std::uint8_t byte{};
+    const ssize_t result = ::recv(accepted, &byte, sizeof(byte), 0);
+    const int receiveError = errno;
+
+    eventstream::closeSocket(accepted);
+    eventstream::closeSocket(client);
+    eventstream::closeSocket(listener);
+    eventstream::cleanupSockets();
+
+    if (result != -1) {
+        std::cerr << "Non-blocking recv() returned " << result
+                  << " instead of -1\n";
+        return false;
+    }
+    if (receiveError != EAGAIN && receiveError != EWOULDBLOCK) {
+        std::cerr << "Non-blocking recv() returned unexpected errno "
+                  << receiveError << '\n';
+        return false;
+    }
+
+    std::cout << "Non-blocking recv() would-block test passed\n";
+    return true;
+#endif
+}
+
 } // namespace
 
 int main() {
     if (!testSendAllRecvExactTransfer() ||
         !testRecvExactAcrossMultipleWrites() ||
-        !testPeerClosesBeforeExactReceive() || !testCleanPeerCloseStatus()) {
+        !testPeerClosesBeforeExactReceive() || !testCleanPeerCloseStatus() ||
+        !testNonBlockingReceiveWithoutData()) {
         return 1;
     }
     std::cout << "All socket I/O tests passed\n";
