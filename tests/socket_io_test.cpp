@@ -8,6 +8,11 @@
 #include <sys/socket.h>
 #endif
 
+#if defined(__linux__)
+#include <sys/epoll.h>
+#include <unistd.h>
+#endif
+
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -278,13 +283,330 @@ bool testNonBlockingReceiveWithoutData() {
 #endif
 }
 
+bool testEpollReadableNotification() {
+#if !defined(__linux__)
+    std::cout << "Linux epoll readiness test skipped on this platform\n";
+    return true;
+#else
+    std::string error;
+    if (!eventstream::initializeSockets(error)) {
+        std::cerr << "epoll readiness setup failed: " << error << '\n';
+        return false;
+    }
+
+    auto listener = eventstream::INVALID_SOCKET_HANDLE;
+    auto client = eventstream::INVALID_SOCKET_HANDLE;
+    auto accepted = eventstream::INVALID_SOCKET_HANDLE;
+    int epollFd = -1;
+    const auto cleanup = [&] {
+        if (epollFd != -1) {
+            close(epollFd);
+        }
+        eventstream::closeSocket(accepted);
+        eventstream::closeSocket(client);
+        eventstream::closeSocket(listener);
+        eventstream::cleanupSockets();
+    };
+
+    listener = eventstream::createTcpListener(0, error);
+    if (!eventstream::isValidSocket(listener)) {
+        std::cerr << "epoll test listener creation failed: " << error << '\n';
+        cleanup();
+        return false;
+    }
+
+    std::uint16_t port{};
+    if (!getBoundPort(listener, port, error)) {
+        std::cerr << "epoll test port lookup failed: " << error << '\n';
+        cleanup();
+        return false;
+    }
+
+    client = eventstream::connectTcp("127.0.0.1", port, error);
+    if (!eventstream::isValidSocket(client)) {
+        std::cerr << "epoll test client connect failed: " << error << '\n';
+        cleanup();
+        return false;
+    }
+
+    accepted = eventstream::acceptTcp(listener, error);
+    if (!eventstream::isValidSocket(accepted)) {
+        std::cerr << "epoll test accept failed: " << error << '\n';
+        cleanup();
+        return false;
+    }
+
+    if (!eventstream::setNonBlocking(accepted, error)) {
+        std::cerr << "epoll test setNonBlocking() failed: " << error << '\n';
+        cleanup();
+        return false;
+    }
+
+    // epollFd is a file descriptor for the epoll instance itself.
+    epollFd = epoll_create1(0);
+    if (epollFd == -1) {
+        std::cerr << "epoll_create1() failed (errno " << errno << ")\n";
+        cleanup();
+        return false;
+    }
+
+    epoll_event registration{};
+    registration.events = EPOLLIN;
+    registration.data.fd = accepted;
+    if (epoll_ctl(epollFd, EPOLL_CTL_ADD, accepted, &registration) == -1) {
+        std::cerr << "epoll_ctl(EPOLL_CTL_ADD) failed (errno " << errno
+                  << ")\n";
+        cleanup();
+        return false;
+    }
+
+    epoll_event events[4]{};
+    const int initiallyReady =
+        epoll_wait(epollFd, events, 4, 0);
+    if (initiallyReady == -1) {
+        std::cerr << "epoll_wait() before send failed (errno " << errno
+                  << ")\n";
+        cleanup();
+        return false;
+    }
+    if (initiallyReady != 0) {
+        std::cerr << "epoll reported an event before client data was sent\n";
+        cleanup();
+        return false;
+    }
+
+    constexpr std::uint8_t expectedByte = 'A';
+    if (!eventstream::sendAll(client, &expectedByte, sizeof(expectedByte),
+                              error)) {
+        std::cerr << "epoll test client send failed: " << error << '\n';
+        cleanup();
+        return false;
+    }
+
+    int readyCount;
+    do {
+        readyCount = epoll_wait(epollFd, events, 4, 1500);
+    } while (readyCount == -1 && errno == EINTR);
+    if (readyCount == -1) {
+        std::cerr << "epoll_wait() failed (errno " << errno << ")\n";
+        cleanup();
+        return false;
+    }
+    if (readyCount == 0) {
+        std::cerr << "epoll_wait() timed out waiting for readable socket\n";
+        cleanup();
+        return false;
+    }
+
+    bool acceptedReadable = false;
+    for (int i = 0; i < readyCount; ++i) {
+        if (events[i].data.fd == accepted &&
+            (events[i].events & EPOLLIN) != 0) {
+            acceptedReadable = true;
+            break;
+        }
+    }
+    if (!acceptedReadable) {
+        std::cerr << "epoll_wait() returned no EPOLLIN event for accepted socket\n";
+        cleanup();
+        return false;
+    }
+
+    std::uint8_t receivedByte{};
+    const ssize_t received = ::recv(accepted, &receivedByte,
+                                    sizeof(receivedByte), 0);
+    if (received <= 0) {
+        std::cerr << "recv() after EPOLLIN returned " << received;
+        if (received == -1) {
+            std::cerr << " (errno " << errno << ')';
+        }
+        std::cerr << '\n';
+        cleanup();
+        return false;
+    }
+    if (receivedByte != expectedByte) {
+        std::cerr << "recv() returned a byte different from the sent payload\n";
+        cleanup();
+        return false;
+    }
+
+    cleanup();
+    std::cout << "epoll EPOLLIN readiness test passed\n";
+    return true;
+#endif
+}
+
+bool testMinimalEpollReadEventLoop() {
+#if !defined(__linux__)
+    std::cout << "Linux epoll read event loop test skipped on this platform\n";
+    return true;
+#else
+    std::string error;
+    if (!eventstream::initializeSockets(error)) {
+        std::cerr << "epoll event loop setup failed: " << error << '\n';
+        return false;
+    }
+
+    auto listener = eventstream::INVALID_SOCKET_HANDLE;
+    auto client = eventstream::INVALID_SOCKET_HANDLE;
+    auto accepted = eventstream::INVALID_SOCKET_HANDLE;
+    int epollFd = -1;
+    const auto cleanup = [&] {
+        if (epollFd != -1) {
+            close(epollFd);
+        }
+        eventstream::closeSocket(accepted);
+        eventstream::closeSocket(client);
+        eventstream::closeSocket(listener);
+        eventstream::cleanupSockets();
+    };
+
+    listener = eventstream::createTcpListener(0, error);
+    if (!eventstream::isValidSocket(listener)) {
+        std::cerr << "epoll event loop listener creation failed: " << error
+                  << '\n';
+        cleanup();
+        return false;
+    }
+
+    std::uint16_t port{};
+    if (!getBoundPort(listener, port, error)) {
+        std::cerr << "epoll event loop port lookup failed: " << error << '\n';
+        cleanup();
+        return false;
+    }
+
+    client = eventstream::connectTcp("127.0.0.1", port, error);
+    if (!eventstream::isValidSocket(client)) {
+        std::cerr << "epoll event loop client connect failed: " << error
+                  << '\n';
+        cleanup();
+        return false;
+    }
+
+    accepted = eventstream::acceptTcp(listener, error);
+    if (!eventstream::isValidSocket(accepted)) {
+        std::cerr << "epoll event loop accept failed: " << error << '\n';
+        cleanup();
+        return false;
+    }
+    if (!eventstream::setNonBlocking(accepted, error)) {
+        std::cerr << "epoll event loop setNonBlocking() failed: " << error
+                  << '\n';
+        cleanup();
+        return false;
+    }
+
+    epollFd = epoll_create1(0);
+    if (epollFd == -1) {
+        std::cerr << "epoll event loop epoll_create1() failed (errno "
+                  << errno << ")\n";
+        cleanup();
+        return false;
+    }
+
+    epoll_event registration{};
+    registration.events = EPOLLIN;
+    registration.data.fd = accepted;
+    if (epoll_ctl(epollFd, EPOLL_CTL_ADD, accepted, &registration) == -1) {
+        std::cerr << "epoll event loop epoll_ctl() failed (errno " << errno
+                  << ")\n";
+        cleanup();
+        return false;
+    }
+
+    const std::vector<std::uint8_t> expected{'A', 'B', 'C'};
+    if (!eventstream::sendAll(client, expected.data(), expected.size(), error)) {
+        std::cerr << "epoll event loop client send failed: " << error << '\n';
+        cleanup();
+        return false;
+    }
+
+    // This state survives each event handler and the next epoll_wait().
+    std::vector<std::uint8_t> receivedBytes(expected.size());
+    std::size_t receivedCount = 0;
+    std::size_t receiveCycles = 0;
+    int waitCount = 0;
+    constexpr int maxWaitCount = 16; // Safety bound even after no-progress events.
+    epoll_event events[4]{};
+    while (receivedCount < expected.size() && waitCount < maxWaitCount) {
+        ++waitCount;
+        const int readyCount = epoll_wait(epollFd, events, 4, 1500);
+        if (readyCount == -1) {
+            const int code = errno;
+            if (code == EINTR) {
+                continue;
+            }
+            std::cerr << "epoll event loop epoll_wait() failed (errno "
+                      << code << ")\n";
+            cleanup();
+            return false;
+        }
+        if (readyCount == 0) {
+            std::cerr << "epoll event loop timed out waiting for data\n";
+            cleanup();
+            return false;
+        }
+
+        for (int i = 0; i < readyCount; ++i) {
+            if (events[i].data.fd != accepted ||
+                (events[i].events & EPOLLIN) == 0) {
+                std::cerr << "epoll event loop returned an unexpected event\n";
+                cleanup();
+                return false;
+            }
+
+            // Read at most one byte per handler to demonstrate repeated LT
+            // notifications for remaining data, independently of send boundaries.
+            ssize_t received;
+            do {
+                received = ::recv(accepted,
+                                  receivedBytes.data() + receivedCount, 1, 0);
+            } while (received == -1 && errno == EINTR);
+            if (received > 0) {
+                receivedCount += static_cast<std::size_t>(received);
+                ++receiveCycles;
+            } else if (received == 0) {
+                std::cerr << "epoll event loop peer closed before all bytes\n";
+                cleanup();
+                return false;
+            } else {
+                const int code = errno;
+                if (code == EAGAIN || code == EWOULDBLOCK) {
+                    continue;
+                }
+                std::cerr << "epoll event loop recv() failed (errno " << code
+                          << ")\n";
+                cleanup();
+                return false;
+            }
+        }
+    }
+
+    cleanup();
+    if (receivedCount != expected.size() || receivedBytes != expected) {
+        std::cerr << "epoll event loop did not receive the complete ABC sequence\n";
+        return false;
+    }
+    if (waitCount < 3 || receiveCycles < 3) {
+        std::cerr << "epoll event loop did not repeat wait / receive cycles\n";
+        return false;
+    }
+    std::cout << "Minimal epoll read event loop test passed ("
+              << receiveCycles << " receive cycles)\n";
+    return true;
+#endif
+}
+
 } // namespace
 
 int main() {
     if (!testSendAllRecvExactTransfer() ||
         !testRecvExactAcrossMultipleWrites() ||
         !testPeerClosesBeforeExactReceive() || !testCleanPeerCloseStatus() ||
-        !testNonBlockingReceiveWithoutData()) {
+        !testNonBlockingReceiveWithoutData() ||
+        !testEpollReadableNotification() ||
+        !testMinimalEpollReadEventLoop()) {
         return 1;
     }
     std::cout << "All socket I/O tests passed\n";
