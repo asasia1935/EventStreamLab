@@ -10,6 +10,7 @@
 
 #if defined(__linux__)
 #include <sys/epoll.h>
+#include <sys/time.h>
 #include <unistd.h>
 #endif
 
@@ -598,6 +599,393 @@ bool testMinimalEpollReadEventLoop() {
 #endif
 }
 
+bool testNonBlockingSendBackpressure() {
+#if !defined(__linux__)
+    std::cout << "Linux non-blocking send pressure test skipped on this platform\n";
+    return true;
+#else
+    std::string error;
+    if (!eventstream::initializeSockets(error)) {
+        std::cerr << "Non-blocking send setup failed: " << error << '\n';
+        return false;
+    }
+
+    auto listener = eventstream::INVALID_SOCKET_HANDLE;
+    auto client = eventstream::INVALID_SOCKET_HANDLE;
+    auto accepted = eventstream::INVALID_SOCKET_HANDLE;
+    const auto cleanup = [&] {
+        eventstream::closeSocket(accepted);
+        eventstream::closeSocket(client);
+        eventstream::closeSocket(listener);
+        eventstream::cleanupSockets();
+    };
+
+    listener = eventstream::createTcpListener(0, error);
+    if (!eventstream::isValidSocket(listener)) {
+        std::cerr << "Non-blocking send listener creation failed: " << error
+                  << '\n';
+        cleanup();
+        return false;
+    }
+
+    std::uint16_t port{};
+    if (!getBoundPort(listener, port, error)) {
+        std::cerr << "Non-blocking send port lookup failed: " << error << '\n';
+        cleanup();
+        return false;
+    }
+
+    client = eventstream::connectTcp("127.0.0.1", port, error);
+    if (!eventstream::isValidSocket(client)) {
+        std::cerr << "Non-blocking send client connect failed: " << error
+                  << '\n';
+        cleanup();
+        return false;
+    }
+
+    accepted = eventstream::acceptTcp(listener, error);
+    if (!eventstream::isValidSocket(accepted)) {
+        std::cerr << "Non-blocking send accept failed: " << error << '\n';
+        cleanup();
+        return false;
+    }
+    if (!eventstream::setNonBlocking(accepted, error)) {
+        std::cerr << "Non-blocking send setNonBlocking() failed: " << error
+                  << '\n';
+        cleanup();
+        return false;
+    }
+
+    // The kernel may adjust this requested size; its exact value is not tested.
+    const int sendBufferSize = 4096;
+    if (setsockopt(accepted, SOL_SOCKET, SO_SNDBUF, &sendBufferSize,
+                   static_cast<socklen_t>(sizeof(sendBufferSize))) == -1) {
+        std::cerr << "setsockopt(SO_SNDBUF) failed (errno " << errno << ")\n";
+        cleanup();
+        return false;
+    }
+
+    std::vector<std::uint8_t> payload(1024 * 1024);
+    for (std::size_t i = 0; i < payload.size(); ++i) {
+        payload[i] = static_cast<std::uint8_t>(i & 0xFF);
+    }
+#ifdef MSG_NOSIGNAL
+    constexpr int sendFlags = MSG_NOSIGNAL;
+#else
+    constexpr int sendFlags = 0;
+#endif
+    constexpr int maxSendAttempts = 1024;
+    int sendAttempts = 0;
+    std::size_t totalSent = 0;
+    std::size_t partialWrites = 0;
+    std::size_t firstPartialSize = 0;
+    bool observedWouldBlock = false;
+    int wouldBlockError = 0;
+
+    // Client stays connected and never calls recv() during this experiment.
+    // Reuse the fixed payload; this is pressure generation, not TX resumption.
+    while (sendAttempts < maxSendAttempts) {
+        ++sendAttempts;
+        const ssize_t result =
+            ::send(accepted, payload.data(), payload.size(), sendFlags);
+        if (result > 0) {
+            const auto sent = static_cast<std::size_t>(result);
+            totalSent += sent;
+            if (sent < payload.size()) {
+                if (partialWrites == 0) {
+                    firstPartialSize = sent;
+                }
+                ++partialWrites;
+            }
+            continue;
+        }
+        if (result == 0) {
+            std::cerr << "Non-blocking send() unexpectedly made no progress\n";
+            cleanup();
+            return false;
+        }
+
+        const int code = errno;
+        if (code == EINTR) {
+            continue;
+        }
+        if (code == EAGAIN || code == EWOULDBLOCK) {
+            observedWouldBlock = true;
+            wouldBlockError = code;
+            break;
+        }
+        std::cerr << "Non-blocking send() failed (errno " << code << ")\n";
+        cleanup();
+        return false;
+    }
+
+    cleanup();
+    if (!observedWouldBlock || totalSent == 0) {
+        std::cerr << "Non-blocking send test did not observe progress followed "
+                  << "by EAGAIN/EWOULDBLOCK within the safety bound ("
+                  << sendAttempts << " attempts, " << totalSent << " bytes)\n";
+        return false;
+    }
+
+    std::cout << "Non-blocking send pressure test passed: send() returned -1, "
+              << "errno=" << wouldBlockError << " (EAGAIN/EWOULDBLOCK); "
+              << totalSent << " bytes accepted, " << sendAttempts
+              << " attempts; partial writes=" << partialWrites;
+    if (partialWrites > 0) {
+        std::cout << " (first: requested " << payload.size() << ", returned "
+                  << firstPartialSize << ')';
+    }
+    std::cout << '\n';
+    return true;
+#endif
+}
+
+bool testEpollWritableTxResume() {
+#if !defined(__linux__)
+    std::cout << "Linux epoll TX resume test skipped on this platform\n";
+    return true;
+#else
+    std::string error;
+    if (!eventstream::initializeSockets(error)) {
+        std::cerr << "epoll TX setup failed: " << error << '\n';
+        return false;
+    }
+
+    auto listener = eventstream::INVALID_SOCKET_HANDLE;
+    auto client = eventstream::INVALID_SOCKET_HANDLE;
+    auto accepted = eventstream::INVALID_SOCKET_HANDLE;
+    int epollFd = -1;
+    std::thread receiver;
+    const auto cleanup = [&] {
+        // Wake a blocked receiver before joining on any sender failure.
+        if (receiver.joinable()) {
+            shutdown(client, SHUT_RDWR);
+            receiver.join();
+        }
+        if (epollFd != -1) {
+            close(epollFd);
+        }
+        eventstream::closeSocket(accepted);
+        eventstream::closeSocket(client);
+        eventstream::closeSocket(listener);
+        eventstream::cleanupSockets();
+    };
+    const auto fail = [&](const std::string& message) {
+        std::cerr << "epoll TX test failed: " << message << '\n';
+        cleanup();
+        return false;
+    };
+
+    listener = eventstream::createTcpListener(0, error);
+    if (!eventstream::isValidSocket(listener)) {
+        return fail(error);
+    }
+    std::uint16_t port{};
+    if (!getBoundPort(listener, port, error)) {
+        return fail(error);
+    }
+    client = eventstream::connectTcp("127.0.0.1", port, error);
+    if (!eventstream::isValidSocket(client)) {
+        return fail(error);
+    }
+    accepted = eventstream::acceptTcp(listener, error);
+    if (!eventstream::isValidSocket(accepted)) {
+        return fail(error);
+    }
+    if (!eventstream::setNonBlocking(accepted, error)) {
+        return fail(error);
+    }
+
+    const int sendBufferSize = 4096;
+    if (setsockopt(accepted, SOL_SOCKET, SO_SNDBUF, &sendBufferSize,
+                   static_cast<socklen_t>(sizeof(sendBufferSize))) == -1) {
+        return fail("setsockopt(SO_SNDBUF), errno=" + std::to_string(errno));
+    }
+    // Safety timeout for blocking receiver reads, including the final EOF read.
+    const timeval receiveTimeout{2, 0};
+    if (setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &receiveTimeout,
+                   static_cast<socklen_t>(sizeof(receiveTimeout))) == -1) {
+        return fail("setsockopt(SO_RCVTIMEO), errno=" + std::to_string(errno));
+    }
+    epollFd = epoll_create1(0);
+    if (epollFd == -1) {
+        return fail("epoll_create1(), errno=" + std::to_string(errno));
+    }
+
+    struct TxState {
+        std::vector<std::uint8_t> buffer;
+        std::size_t offset = 0;
+    };
+    TxState tx{std::vector<std::uint8_t>(1024 * 1024)};
+    // Deterministic bytes without a short repeating pattern, so misplaced
+    // chunks are detected by the receiver's full-buffer comparison.
+    std::uint32_t pattern = 0x12345678;
+    for (auto& byte : tx.buffer) {
+        pattern ^= pattern << 13;
+        pattern ^= pattern >> 17;
+        pattern ^= pattern << 5;
+        byte = static_cast<std::uint8_t>(pattern & 0xFF);
+    }
+    std::vector<std::uint8_t> receivedBytes(tx.buffer.size());
+    std::size_t receivedCount = 0;
+    bool receiverSucceeded = false;
+    std::string receiverError;
+
+#ifdef MSG_NOSIGNAL
+    constexpr int sendFlags = MSG_NOSIGNAL;
+#else
+    constexpr int sendFlags = 0;
+#endif
+    constexpr int maxSendAttempts = 4096;
+    constexpr int maxWaitCycles = 1024;
+    int sendAttempts = 0;
+    int waitCycles = 0;
+    int partialWrites = 0;
+    int wouldBlockCount = 0;
+    int writableEvents = 0;
+    int resumeSendAttempts = 0;
+    std::size_t firstBlockedOffset = 0;
+    bool writableInterest = false;
+
+    while (tx.offset < tx.buffer.size()) {
+        if (sendAttempts >= maxSendAttempts) {
+            return fail("send attempt safety bound reached");
+        }
+        ++sendAttempts;
+        if (writableEvents > 0) {
+            ++resumeSendAttempts;
+        }
+        const std::size_t remaining = tx.buffer.size() - tx.offset;
+        const ssize_t sent = ::send(accepted, tx.buffer.data() + tx.offset,
+                                   remaining, sendFlags);
+        if (sent > 0) {
+            const auto progress = static_cast<std::size_t>(sent);
+            if (progress > remaining) {
+                return fail("send result exceeded remaining bytes");
+            }
+            partialWrites += progress < remaining;
+            tx.offset += progress;
+            continue;
+        }
+        if (sent == 0) {
+            return fail("send() unexpectedly made no progress");
+        }
+        const int code = errno;
+        if (code == EINTR) {
+            continue; // offset is unchanged.
+        }
+        if (code != EAGAIN && code != EWOULDBLOCK) {
+            return fail("send(), errno=" + std::to_string(code));
+        }
+        ++wouldBlockCount;
+        if (wouldBlockCount == 1) {
+            firstBlockedOffset = tx.offset;
+            epoll_event registration{};
+            registration.events = EPOLLOUT;
+            registration.data.fd = accepted;
+            if (epoll_ctl(epollFd, EPOLL_CTL_ADD, accepted, &registration) == -1) {
+                return fail("epoll_ctl(ADD), errno=" + std::to_string(errno));
+            }
+            writableInterest = true;
+
+            // No receiver reads occur until the sender has observed EAGAIN.
+            receiver = std::thread([&] {
+                constexpr int maxReceiveAttempts = 8192;
+                std::uint8_t extraByte{};
+                for (int attempt = 0; attempt < maxReceiveAttempts; ++attempt) {
+                    const bool full = receivedCount == receivedBytes.size();
+                    auto* destination = full ? &extraByte
+                                             : receivedBytes.data() + receivedCount;
+                    const std::size_t capacity =
+                        full ? 1 : receivedBytes.size() - receivedCount;
+                    const ssize_t result = ::recv(client, destination, capacity, 0);
+                    if (result > 0) {
+                        if (full) {
+                            receiverError = "received extra bytes after payload";
+                            return;
+                        }
+                        receivedCount += static_cast<std::size_t>(result);
+                        continue;
+                    }
+                    if (result == 0) {
+                        receiverSucceeded = full;
+                        if (!full) {
+                            receiverError = "EOF before complete payload";
+                        }
+                        return;
+                    }
+                    const int receiveCode = errno;
+                    if (receiveCode == EINTR) {
+                        continue;
+                    }
+                    receiverError = "recv() error or safety timeout, errno=" +
+                                    std::to_string(receiveCode);
+                    return;
+                }
+                receiverError = "receive attempt safety bound reached";
+            });
+        }
+
+        // EAGAIN preserves tx.offset and transfers control to readiness wait.
+        epoll_event events[4]{};
+        int readyCount;
+        do {
+            if (waitCycles >= maxWaitCycles) {
+                return fail("epoll wait safety bound reached");
+            }
+            ++waitCycles;
+            readyCount = epoll_wait(epollFd, events, 4, 1500);
+        } while (readyCount == -1 && errno == EINTR);
+        if (readyCount == -1) {
+            return fail("epoll_wait(), errno=" + std::to_string(errno));
+        }
+        if (readyCount == 0) {
+            return fail("epoll_wait() safety timeout");
+        }
+        bool writable = false;
+        for (int i = 0; i < readyCount; ++i) {
+            if (events[i].data.fd == accepted &&
+                (events[i].events & EPOLLOUT) != 0) {
+                ++writableEvents;
+                writable = true;
+            }
+        }
+        if (!writable) {
+            return fail("no EPOLLOUT for sender");
+        }
+        // The next send resumes from the saved tx.offset, not buffer start.
+    }
+
+    if (!writableInterest || firstBlockedOffset == 0 || writableEvents == 0 ||
+        resumeSendAttempts == 0) {
+        return fail("initial progress / EAGAIN / EPOLLOUT resume not observed");
+    }
+    // TX is complete: remove writable interest before shutting down the stream.
+    if (epoll_ctl(epollFd, EPOLL_CTL_DEL, accepted, nullptr) == -1) {
+        return fail("epoll_ctl(DEL), errno=" + std::to_string(errno));
+    }
+    writableInterest = false;
+    if (shutdown(accepted, SHUT_WR) == -1) {
+        return fail("shutdown(SHUT_WR), errno=" + std::to_string(errno));
+    }
+    receiver.join();
+    if (!receiverSucceeded || receivedBytes != tx.buffer) {
+        return fail("receiver payload/EOF validation: " + receiverError);
+    }
+
+    cleanup();
+    std::cout << "epoll TX resume test passed: first EAGAIN offset="
+              << firstBlockedOffset << ", partial writes=" << partialWrites
+              << ", EAGAIN count=" << wouldBlockCount
+              << ", EPOLLOUT events=" << writableEvents
+              << ", resume sends=" << resumeSendAttempts
+              << ", final offset=" << tx.offset
+              << ", received=" << receivedCount
+              << "; payload identical, EOF verified, EPOLLOUT interest removed\n";
+    return true;
+#endif
+}
+
 } // namespace
 
 int main() {
@@ -606,7 +994,9 @@ int main() {
         !testPeerClosesBeforeExactReceive() || !testCleanPeerCloseStatus() ||
         !testNonBlockingReceiveWithoutData() ||
         !testEpollReadableNotification() ||
-        !testMinimalEpollReadEventLoop()) {
+        !testMinimalEpollReadEventLoop() ||
+        !testNonBlockingSendBackpressure() ||
+        !testEpollWritableTxResume()) {
         return 1;
     }
     std::cout << "All socket I/O tests passed\n";
