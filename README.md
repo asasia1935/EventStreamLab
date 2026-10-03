@@ -23,9 +23,10 @@ Add complexity when measurements identify a problem that needs it.
 - Blocking socket helpers provide `sendAll()`, exact receive, and clean EOF
   detection distinct from truncated input.
 - Producer sends a sequence of Frames at the configured `--fps` for the
-  configured `--frames` count. Server validates and forwards each Frame
-  sequentially to connected Consumers; Consumers validate the stream and report
-  elapsed time.
+  configured `--frames` count. Server validates each Frame; Consumers validate
+  the stream and report elapsed time. Linux Server uses a single-threaded epoll
+  event loop with non-blocking Producer RX and independent Consumer TX queues.
+  Other platforms retain the sequential blocking Server path.
 - Slow Consumers can pause after processing each complete Frame using
   `--mode slow --delay-ms N`.
 - The Day 2 Debug build and all five CTest tests passed. Manual stream checks
@@ -37,7 +38,7 @@ Add complexity when measurements identify a problem that needs it.
 Synthetic Producer
         |
         v
-   Blocking Server
+      Server
         |
    +----+----+
    |         |
@@ -46,10 +47,22 @@ Consumer  Consumer
 ```
 
 The Producer connects to the Server's producer port. Consumers connect to its
-consumer port. The Server accepts the configured number of Consumers, then
-receives each Producer Frame and sends its Header and Payload to each Consumer
-in accept order. These connections and Frame transfers are implemented with
-blocking TCP sockets.
+consumer port. The Server accepts the Producer first, then the configured
+number of Consumers. Connection setup uses blocking sockets.
+
+On Linux, the connected sockets become non-blocking. Producer EPOLLIN handlers
+preserve partial Header/Payload state and enqueue shared immutable wire Frames
+to each Consumer. Each Consumer has an independent queue and front offset;
+EAGAIN enables EPOLLOUT, and draining the queue disables it. These queues are
+intentionally unbounded at this stage. Producer EOF ends input; each Consumer
+stream closes when its queue drains. Other platforms forward Header and
+Payload with the existing blocking helpers.
+
+Linux summary counters include queued/completed Frames, bytes accepted by
+send(), partial writes, EAGAIN, EPOLLOUT wakes, and peak pending Frames/bytes.
+`total_send_us` counts active send() calls, and `max_send_us` is the maximum
+sum of those calls for one completed Frame; neither includes EPOLLOUT wait
+time. The historical blocking benchmark below includes blocking send waits.
 
 ## Protocol and Workload
 
