@@ -30,4 +30,4 @@ Both correctness checks passed. Day 6 unbounded SLOW peak at 1800 Frames was 136
 
 Lossless/reliable domains may need a different policy. No Day 8 Release benchmark is included.
 
-Artifacts: raw_runs.json, events.csv, samples/ and logs/. A SLOW exit 1 is accepted only for narrowly recognized transport termination corroborated by Server overflow metrics; validation failures and crashes remain failures.
+Repository artifacts retain summary.csv, events.csv and sample CSVs. The original local benchmark run additionally produced raw_runs.json and per-process logs, which were intentionally not committed. A SLOW exit 1 is accepted only for narrowly recognized transport termination corroborated by Server overflow metrics; validation failures and crashes remain failures.
