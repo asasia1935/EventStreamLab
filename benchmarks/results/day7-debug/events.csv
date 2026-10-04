@@ -1,0 +1,2 @@
+scenario,frames_target,elapsed_ms,consumer_connection,pending_frames,pending_bytes,incoming_frame_bytes,limit_bytes,policy
+SLOW/FAST,1800,16004,1,288,33516597,102434,33554432,disconnect

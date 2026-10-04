@@ -31,6 +31,8 @@ struct ConsumerSendMetrics {
     std::uint64_t epollout_wakes{};
     std::size_t max_pending_frames{};
     std::size_t max_pending_bytes{};
+    std::uint64_t queue_overflow_count{};
+    bool disconnected_due_to_overflow{};
 #endif
 };
 
@@ -51,6 +53,8 @@ const char* validationErrorMessage(
 }
 
 #if defined(__linux__)
+
+constexpr std::size_t MAX_CONSUMER_PENDING_BYTES = 32ULL * 1024ULL * 1024ULL;
 
 enum class RxPhase { Header, Payload };
 
@@ -161,7 +165,9 @@ bool processProducerRx(int epollFd, eventstream::SocketHandle producerSocket,
                        std::vector<eventstream::SocketHandle>& consumerSockets,
                        std::vector<ConsumerTxState>& consumerTx,
                        std::vector<ConsumerSendMetrics>& consumerMetrics,
-                       std::uint64_t& framesReceived, std::string& error) {
+                       std::uint64_t& framesReceived,
+                       std::chrono::steady_clock::time_point samplingStart,
+                       std::string& error) {
     for (;;) {
         if (rx.phase == RxPhase::Header &&
             rx.header_offset == rx.wire_header.size()) {
@@ -203,8 +209,25 @@ bool processProducerRx(int epollFd, eventstream::SocketHandle producerSocket,
                 }
                 auto& tx = consumerTx[i];
                 auto& metrics = consumerMetrics[i];
+                // Check before enqueue; subtraction is safe even for oversized frames.
+                if (frame->size() > MAX_CONSUMER_PENDING_BYTES ||
+                    tx.pending_bytes > MAX_CONSUMER_PENDING_BYTES - frame->size()) {
+                    ++metrics.queue_overflow_count;
+                    metrics.disconnected_due_to_overflow = true;
+                    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - samplingStart).count();
+                    std::cout << "queue_overflow elapsed_ms=" << elapsed
+                              << " consumer_connection=" << (i + 1)
+                              << " pending_frames=" << tx.pending_frames.size()
+                              << " pending_bytes=" << tx.pending_bytes
+                              << " incoming_frame_bytes=" << frame->size()
+                              << " limit_bytes=" << MAX_CONSUMER_PENDING_BYTES
+                              << " policy=disconnect\n";
+                    closeConsumer(epollFd, consumerSockets[i], tx, i, "queue overflow");
+                    continue; // The same frame still goes to other Consumers.
+                }
                 const bool wasEmpty = tx.pending_frames.empty();
-                tx.pending_frames.push_back(frame); // Intentionally unbounded.
+                tx.pending_frames.push_back(frame);
                 tx.pending_bytes += frame->size();
                 ++metrics.frames_enqueued;
                 metrics.max_pending_frames =
@@ -384,7 +407,7 @@ bool runLinuxEventLoop(eventstream::SocketHandle producerSocket,
                     !processProducerRx(epollFd, producerSocket, rx,
                                        producerFinished, consumerSockets,
                                        consumerTx, consumerMetrics, framesReceived,
-                                       error)) {
+                                       samplingStart, error)) {
                     return fail();
                 }
                 if (producerFinished) {
@@ -641,7 +664,10 @@ int main(int argc, char* argv[]) {
                   << "eagain_count=" << metrics.eagain_count << '\n'
                   << "epollout_wakes=" << metrics.epollout_wakes << '\n'
                   << "max_pending_frames=" << metrics.max_pending_frames << '\n'
-                  << "max_pending_bytes=" << metrics.max_pending_bytes << '\n';
+                  << "max_pending_bytes=" << metrics.max_pending_bytes << '\n'
+                  << "queue_overflow_count=" << metrics.queue_overflow_count << '\n'
+                  << "disconnected_due_to_overflow="
+                  << metrics.disconnected_due_to_overflow << '\n';
 #endif
     }
     cleanup();
