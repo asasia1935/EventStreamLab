@@ -1,0 +1,4 @@
+scenario,run,frames_target,elapsed_ms,consumer_connection,pending_frames,pending_bytes,incoming_frame_bytes,limit_bytes,policy
+SLOW/FAST overload,1,1800,16300,1,288,33521741,102434,33554432,disconnect
+SLOW/FAST overload,2,1800,16300,1,288,33521741,102434,33554432,disconnect
+SLOW/FAST overload,3,1800,17867,1,292,33544838,102434,33554432,disconnect
