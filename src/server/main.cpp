@@ -315,13 +315,44 @@ bool runLinuxEventLoop(eventstream::SocketHandle producerSocket,
     std::cout << "Linux single-threaded epoll event loop started\n";
     ProducerRxState rx;
     bool producerFinished = false;
+    const auto samplingStart = std::chrono::steady_clock::now();
+    auto nextSampleDue = samplingStart + std::chrono::seconds(1);
+    const auto sampleConsumer = [&](std::size_t index) {
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - samplingStart).count();
+        const auto& tx = consumerTx[index];
+        const auto& metrics = consumerMetrics[index];
+        std::cout << "queue_sample elapsed_ms=" << elapsed
+                  << " producer_finished=" << producerFinished
+                  << " frames_received=" << framesReceived
+                  << " consumer_connection=" << (index + 1)
+                  << " pending_frames=" << tx.pending_frames.size()
+                  << " pending_bytes=" << tx.pending_bytes
+                  << " front_offset=" << tx.front_offset
+                  << " frames_enqueued=" << metrics.frames_enqueued
+                  << " frames_completed=" << metrics.frames_forwarded << '\n';
+    };
+    const auto sampleActiveConsumers = [&] {
+        for (std::size_t i = 0; i < consumerSockets.size(); ++i) {
+            if (eventstream::isValidSocket(consumerSockets[i])) {
+                sampleConsumer(i);
+            }
+        }
+    };
+    sampleActiveConsumers();
     for (;;) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= nextSampleDue) {
+            sampleActiveConsumers();
+            nextSampleDue = now + std::chrono::seconds(1);
+        }
         if (producerFinished) {
             bool allDrained = true;
             for (std::size_t i = 0; i < consumerSockets.size(); ++i) {
                 if (!consumerTx[i].pending_frames.empty()) {
                     allDrained = false;
                 } else if (eventstream::isValidSocket(consumerSockets[i])) {
+                    sampleConsumer(i); // Final zero sample before stream close.
                     closeConsumer(epollFd, consumerSockets[i], consumerTx[i], i,
                                   "stream completed");
                 }
@@ -331,7 +362,13 @@ bool runLinuxEventLoop(eventstream::SocketHandle producerSocket,
             }
         }
         epoll_event events[16]{};
-        const int readyCount = epoll_wait(epollFd, events, 16, -1);
+        // Round up to avoid polling in the final fractional millisecond.
+        const auto remainingMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            nextSampleDue - std::chrono::steady_clock::now()).count();
+        const int timeoutMs = static_cast<int>((std::max)(
+            std::int64_t{0}, (std::min)(std::int64_t{1000},
+                                     static_cast<std::int64_t>(remainingMs) + 1)));
+        const int readyCount = epoll_wait(epollFd, events, 16, timeoutMs);
         if (readyCount == -1) {
             if (errno == EINTR) {
                 continue;
@@ -349,6 +386,9 @@ bool runLinuxEventLoop(eventstream::SocketHandle producerSocket,
                                        consumerTx, consumerMetrics, framesReceived,
                                        error)) {
                     return fail();
+                }
+                if (producerFinished) {
+                    sampleActiveConsumers(); // Observe the transition to drain.
                 }
                 continue;
             }
